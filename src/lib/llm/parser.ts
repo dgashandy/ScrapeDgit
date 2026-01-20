@@ -2,9 +2,12 @@ import OpenAI from "openai";
 import { ParsedQuery, UserContext } from "@/lib/types";
 
 // System prompt for context-aware parsing with conversation history
-const CONTEXT_SYSTEM_PROMPT = `You are ScrapeDgit, an AI assistant that helps users find the best products by searching across multiple Indonesian e-commerce platforms (Tokopedia, Shopee, Lazada, Blibli).
+const CONTEXT_SYSTEM_PROMPT = `You are ScrapeDgit, an AI assistant that helps users find the best products by searching across ALL Indonesian e-commerce platforms simultaneously (Tokopedia, Shopee, Lazada, Blibli).
 
-IMPORTANT: Always respond in ENGLISH. You are ScrapeDgit, NOT any specific e-commerce platform.
+CRITICAL RULES:
+1. ALWAYS respond in ENGLISH
+2. NEVER ask user which platform to search - you ALWAYS search ALL platforms automatically
+3. When user asks for a product, you search Tokopedia, Shopee, Lazada, and Blibli simultaneously
 
 You will receive:
 1. The user's current message
@@ -12,31 +15,40 @@ You will receive:
 3. Currently accumulated search constraints (if any)
 
 YOUR TASK:
-Parse the user's message and UPDATE the accumulated constraints. You should MERGE new information with existing constraints, not replace everything.
+Parse the user's message and UPDATE the accumulated constraints. MERGE new information, don't replace.
 
-RULES:
-1. GREETINGS: "Hi", "Hello" without product intent → isSearch=false, respond with greeting and ask what they're looking for
-2. PRODUCT MENTIONS: If user mentions product type (laptop, phone, deskmat, etc.) → set keyword, keep isSearch=true
-3. BUDGET: Extract price range in IDR (e.g., "200-300K" = 200000-300000, "3-5 juta" = 3000000-5000000)
-4. SPECS/COLORS: Add to specConstraints array (e.g., "16GB RAM", "blue color", "Intel i5")
-5. BRAND: Extract brand preference (e.g., "lenovo if can" → preferredBrand: "lenovo")
-6. PARTIAL REMOVAL: When user says "remove X filter" or "remove the X":
-   - ONLY remove that specific constraint (e.g., remove "blue" from specConstraints)
-   - KEEP ALL OTHER CONSTRAINTS including keyword, budget, etc.
-   - Do NOT reset isSearch or keyword when removing a filter
-7. NO PREFERENCE: If user says "no preference", "idk", "surprise me", "no" → ready for confirmation
-8. CONFIRMATION READY: When we have at least keyword and user confirms or has no more requirements → responseType="confirmation"
+KEYWORD RULES (CRITICAL - READ CAREFULLY):
+1. The FIRST product mentioned becomes the keyword and should NOT be replaced by clarification answers
+2. "give me TWS, red color, around 500K" → keyword: "TWS", specConstraints: ["red color"]
+3. If user already said "TWS" and then selects "gaming" from options → keyword stays "TWS", add "gaming" to specConstraints
+4. ONLY replace keyword if user EXPLICITLY corrects it: "not phone, but headphone"
+5. Clarification answers like "gaming", "wireless" are SPECS, not keyword replacements
+6. DO NOT truncate keywords - "headphone" must NOT become "phone"
 
-PARTIAL REMOVAL EXAMPLES:
-- "remove blue color" → only remove "blue" from specConstraints, keep keyword and everything else
-- "remove budget limit" → set minPrice=null, maxPrice=null, keep keyword
-- "change brand to asus" → set preferredBrand="asus", keep everything else
+BUDGET PARSING RULES:
+1. "200-500K" → minPrice: 200000, maxPrice: 500000
+2. "around 500K" or "sekitar 500K" → minPrice: 400000, maxPrice: 600000 (±100K or ±20% range)
+3. "about 1 juta" → minPrice: 800000, maxPrice: 1200000 (±20%)
+4. "under 500K" → maxPrice: 500000
+5. "above 1 million" → minPrice: 1000000
+6. "3-5 juta" → minPrice: 3000000, maxPrice: 5000000
+
+GENERAL RULES:
+1. GREETINGS: "Hi", "Hello" without product → isSearch=false, ask what they're looking for
+2. PRODUCT MENTIONS: Extract product as keyword, set isSearch=true
+3. SPECS/COLORS: Add to specConstraints array (gaming, wireless, red, etc.)
+4. BRAND: Extract brand preference
+5. When ready: Have keyword → go to confirmation, don't over-clarify
+6. NO PREFERENCE: "no", "no preference" → ready for confirmation
+
+EXAMPLES:
+- "give me TWS, red color, around 500K" → keyword: "TWS", specConstraints: ["red color"], minPrice: 400000, maxPrice: 600000
+- User selected "gaming earbuds" from options where keyword was "TWS" → keyword: "TWS", specConstraints: ["red color", "gaming"]
+- "robin figure HSR" → keyword: "robin figure HSR", search immediately on all platforms
 
 IMPORTANT:
-- ALWAYS respond in English
-- PRESERVE existing constraints unless user explicitly changes them
-- If user provides partial info, KEEP existing constraints and ADD new ones
-- When asking "anything else?", if user says "no" → go to confirmation, don't loop
+- PRESERVE existing keyword when user clarifies with type/style preferences
+- NEVER ask "which platform?" - always search all 4 platforms
 
 OUTPUT FORMAT (JSON):
 {
@@ -155,30 +167,75 @@ export async function parseWithContext(
             userLocation: userLocation || existingQuery?.userLocation,
             needsClarification: parsed.responseType === "clarification",
             clarificationQuestion: parsed.responseType === "clarification" ? parsed.responseMessage : undefined,
+            // Preserve asked tracking fields
+            budgetAsked: existingQuery?.budgetAsked,
+            specsAsked: existingQuery?.specsAsked,
+            brandAsked: existingQuery?.brandAsked,
         };
+
+        // Post-process "around X" budget patterns to ensure ±100K or ±20% range
+        const aroundPattern = /(?:around|sekitar|about|approximately|kira-kira)\s*(\d+)\s*(K|k|ribu|rb|jt|juta|million|M)?/i;
+        const aroundMatch = message.match(aroundPattern);
+        if (aroundMatch) {
+            let baseValue = parseInt(aroundMatch[1]);
+            const unit = aroundMatch[2]?.toLowerCase() || "";
+
+            // Convert to full number
+            if (unit === "k" || unit === "ribu" || unit === "rb") {
+                baseValue *= 1000;
+            } else if (unit === "jt" || unit === "juta" || unit === "million" || unit === "m") {
+                baseValue *= 1000000;
+            }
+
+            // Apply ±100K or ±20% range (whichever is larger)
+            const variation = Math.max(100000, baseValue * 0.2);
+            updatedQuery.minPrice = Math.max(0, baseValue - variation);
+            updatedQuery.maxPrice = baseValue + variation;
+        }
 
         // Determine quick replies based on response type and current state
         let quickReplies = parsed.quickReplies;
+        let responseType = parsed.responseType;
+
         if (!quickReplies) {
-            if (parsed.responseType === "greeting") {
+            if (responseType === "greeting") {
                 quickReplies = QUICK_REPLIES.greeting;
-            } else if (parsed.responseType === "clarification") {
+            } else if (responseType === "clarification") {
                 if (!updatedQuery.keyword) {
                     quickReplies = QUICK_REPLIES.askProduct;
-                } else if (!updatedQuery.minPrice && !updatedQuery.maxPrice) {
+                } else if ((!updatedQuery.minPrice && !updatedQuery.maxPrice) && !updatedQuery.budgetAsked) {
+                    // Only ask budget if not already asked
                     quickReplies = QUICK_REPLIES.askBudget;
-                } else {
+                    updatedQuery.budgetAsked = true;
+                } else if (!updatedQuery.specsAsked) {
+                    // Only ask specs if not already asked
                     quickReplies = QUICK_REPLIES.askSpecs;
+                    updatedQuery.specsAsked = true;
+                } else {
+                    // All asked, go to confirmation
+                    responseType = "confirmation";
+                    quickReplies = QUICK_REPLIES.confirmation;
                 }
-            } else if (parsed.responseType === "confirmation") {
+            } else if (responseType === "confirmation") {
                 quickReplies = QUICK_REPLIES.confirmation;
+            }
+        }
+
+        // Check if user said "no preference" variants and mark as asked
+        const noPreferencePatterns = /no budget|no preference|no limit|any budget|doesn't matter|don't care|idk|surprise me/i;
+        if (noPreferencePatterns.test(message)) {
+            if (!updatedQuery.minPrice && !updatedQuery.maxPrice) {
+                updatedQuery.budgetAsked = true;
+            }
+            if (!updatedQuery.specConstraints?.length) {
+                updatedQuery.specsAsked = true;
             }
         }
 
         return {
             updatedQuery,
             responseMessage: parsed.responseMessage || "How can I help you?",
-            responseType: parsed.responseType || "clarification",
+            responseType: responseType || "clarification",
             quickReplies,
         };
     } catch (error) {
@@ -281,7 +338,7 @@ export function buildConfirmationMessage(query: ParsedQuery): string {
     const parts: string[] = [];
 
     if (query.keyword) {
-        parts.push(`**${query.keyword}**`);
+        parts.push(query.keyword);
     }
 
     if (query.preferredBrand) {
@@ -289,9 +346,17 @@ export function buildConfirmationMessage(query: ParsedQuery): string {
     }
 
     if (query.minPrice || query.maxPrice) {
-        const min = query.minPrice ? `${(query.minPrice / 1000000).toFixed(0)}` : "0";
-        const max = query.maxPrice ? `${(query.maxPrice / 1000000).toFixed(0)}` : "∞";
-        parts.push(`budget: ${min}-${max} million IDR`);
+        const formatPrice = (price: number): string => {
+            if (price >= 1000000) {
+                return `${(price / 1000000).toFixed(price % 1000000 === 0 ? 0 : 1)} million`;
+            } else if (price >= 1000) {
+                return `${(price / 1000).toFixed(0)}K`;
+            }
+            return price.toString();
+        };
+        const min = query.minPrice ? formatPrice(query.minPrice) : "0";
+        const max = query.maxPrice ? formatPrice(query.maxPrice) : "no limit";
+        parts.push(`budget: ${min}-${max} IDR`);
     }
 
     if (query.specConstraints && query.specConstraints.length > 0) {

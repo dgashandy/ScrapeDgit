@@ -35,6 +35,10 @@ export interface ParsedQuery {
     preferredBrand?: string;
     needsClarification: boolean;
     clarificationQuestion?: string;
+    // Tracking fields to prevent looping on "no preference" answers
+    budgetAsked?: boolean;      // User was asked about budget
+    specsAsked?: boolean;       // User was asked about specs
+    brandAsked?: boolean;       // User was asked about brand
 }
 
 export interface UserContext {

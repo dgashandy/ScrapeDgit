@@ -48,6 +48,7 @@ export async function GET(
             data: {
                 id: session.id,
                 title: session.title,
+                accumulatedQuery: session.accumulatedQuery,
                 messages: session.messages.map((msg) => ({
                     id: msg.id,
                     role: msg.role.toLowerCase(),

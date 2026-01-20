@@ -20,11 +20,11 @@ const guestSessions = new Map<string, {
 setInterval(() => {
     const now = Date.now();
     const maxAge = 30 * 60 * 1000; // 30 minutes
-    for (const [id, session] of guestSessions.entries()) {
+    Array.from(guestSessions.entries()).forEach(([id, session]) => {
         if (now - session.createdAt > maxAge) {
             guestSessions.delete(id);
         }
-    }
+    });
 }, 5 * 60 * 1000);
 
 function generateGuestSessionId(): string {
