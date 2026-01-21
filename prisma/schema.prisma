@@ -144,3 +144,12 @@ model SearchResult {
   @@index([finalScore])
   @@index([source])
 }
+
+// ==================== MIGRATION TRACKING ====================
+
+model SchemaVersion {
+  id          Int      @id @default(autoincrement())
+  version     String   @unique
+  description String
+  appliedAt   DateTime @default(now())
+}

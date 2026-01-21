@@ -70,6 +70,16 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
+## Database Migrations
+
+The project maintains a structured migration history in `prisma/migrations/`. These files document the schema evolution and should be applied in order:
+
+- `001_20260101_init.sql`: Initial schema setup
+- `002_20260108_add_accumulated_query.sql`: Added `accumulatedQuery` to `ChatSession`
+- `003_20260115_add_schema_version.sql`: Added `SchemaVersion` tracking table
+
+Migrations are tracked in the `SchemaVersion` table within the database.
+
 ## Environment Variables
 
 | Variable | Description |
