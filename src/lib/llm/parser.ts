@@ -76,6 +76,27 @@ const QUICK_REPLIES = {
     confirmation: ["Yes, search now", "I want to modify"],
 };
 
+// Helper to format budget for display
+function formatBudget(minPrice: number | undefined, maxPrice: number | undefined): string {
+    const formatPrice = (price: number): string => {
+        if (price >= 1000000) {
+            return `${(price / 1000000).toFixed(price % 1000000 === 0 ? 0 : 1)}M`;
+        } else if (price >= 1000) {
+            return `${(price / 1000).toFixed(0)}K`;
+        }
+        return price.toString();
+    };
+
+    if (minPrice && maxPrice) {
+        return `${formatPrice(minPrice)}-${formatPrice(maxPrice)}`;
+    } else if (maxPrice) {
+        return `under ${formatPrice(maxPrice)}`;
+    } else if (minPrice) {
+        return `above ${formatPrice(minPrice)}`;
+    }
+    return "any budget";
+}
+
 
 let openaiClient: OpenAI | null = null;
 
@@ -193,6 +214,49 @@ export async function parseWithContext(
             updatedQuery.maxPrice = baseValue + variation;
         }
 
+        // Post-process: Clean up keyword (remove filler words like "recommendation", colors, etc.)
+        if (updatedQuery.keyword) {
+            const fillerWords = ["recommendation", "recommendations", "suggest", "suggestion", "suggestions", "find", "search", "looking", "for", "me", "a", "an", "the", "give", "show", "help", "some", "please"];
+            const colors = ["white", "black", "red", "blue", "green", "yellow", "pink", "purple", "orange", "brown", "grey", "gray", "gold", "silver"];
+
+            let keywordParts = updatedQuery.keyword.toLowerCase().split(/[\s,]+/);
+            const extractedColors: string[] = [];
+
+            // Extract colors to specConstraints
+            keywordParts = keywordParts.filter(part => {
+                if (colors.includes(part)) {
+                    extractedColors.push(part + " color");
+                    return false;
+                }
+                return !fillerWords.includes(part) && part.length > 1;
+            });
+
+            if (keywordParts.length > 0) {
+                // Keep just the main product keyword (first 2 meaningful words max)
+                updatedQuery.keyword = keywordParts.slice(0, 2).join(" ");
+            }
+
+            // Add extracted colors to specConstraints
+            if (extractedColors.length > 0) {
+                updatedQuery.specConstraints = [
+                    ...(updatedQuery.specConstraints || []),
+                    ...extractedColors.filter(c => !updatedQuery.specConstraints?.includes(c))
+                ];
+            }
+        }
+
+        // Post-process: If we found a budget but LLM is still asking for budget, override responseType
+        if (updatedQuery.minPrice || updatedQuery.maxPrice) {
+            // We have budget, move to next step
+            if (parsed.responseType === "clarification" && parsed.responseMessage?.toLowerCase().includes("budget")) {
+                // Change to ask for specs instead, or confirmation if we have everything
+                if (!updatedQuery.specsAsked) {
+                    parsed.responseType = "clarification";
+                    parsed.responseMessage = `Got it! Looking for ${updatedQuery.keyword} around ${formatBudget(updatedQuery.minPrice, updatedQuery.maxPrice)}. Do you have any specific requirements (brand, features, etc.)?`;
+                }
+            }
+        }
+
         // Determine quick replies based on response type and current state
         let quickReplies = parsed.quickReplies;
         let responseType = parsed.responseType;
@@ -268,9 +332,11 @@ function fallbackParse(
         needsClarification: false,
     };
 
-    // Greetings check
+    // Greetings check - only pure greetings without product info
     const greetings = ["hi", "hello", "halo", "hey", "bro", "p"];
-    if (greetings.some(g => queryLower.trim() === g)) {
+    const isOnlyGreeting = greetings.some(g => queryLower.trim() === g);
+
+    if (isOnlyGreeting && !existingQuery?.keyword) {
         return {
             updatedQuery: { ...updatedQuery, isSearch: false },
             responseMessage: "Hello! What product are you looking for today?",
@@ -279,8 +345,8 @@ function fallbackParse(
         };
     }
 
-    // Product keywords
-    const productTerms = ["laptop", "phone", "handphone", "hp", "earbuds", "earphone", "headphone", "keyboard", "monitor", "tablet"];
+    // Product keywords - known common products
+    const productTerms = ["laptop", "phone", "handphone", "hp", "earbuds", "earphone", "headphone", "keyboard", "monitor", "tablet", "jacket", "shoes", "bag", "watch", "camera", "speaker", "mouse", "charger", "cable", "case"];
     for (const term of productTerms) {
         if (queryLower.includes(term)) {
             updatedQuery.keyword = term === "hp" || term === "handphone" ? "phone" : term;
@@ -289,15 +355,121 @@ function fallbackParse(
         }
     }
 
-    // Price extraction
-    const priceMatch = query.match(/(\d+)\s*[-–]\s*(\d+)\s*(juta|jt|million|mio)/i);
+    // If no known product found but we have a message that's not just greeting,
+    // treat the whole message as a keyword (for products like "TWS", "figure", etc.)
+    if (!updatedQuery.keyword && !isOnlyGreeting) {
+        // Extract the main product term - remove common filler words
+        const fillerWords = ["find", "me", "a", "an", "the", "give", "show", "i", "want", "need", "looking", "for", "please", "recommendation", "recommend", "get", "buy", "search", "help", "some", "can", "you", "could"];
+        const words = queryLower.split(/\s+/).filter(w => !fillerWords.includes(w) && w.length > 1);
+
+        if (words.length > 0) {
+            // Use the first meaningful word(s) as keyword
+            updatedQuery.keyword = words.slice(0, 3).join(" ").trim();
+            updatedQuery.isSearch = true;
+        }
+    }
+
+    // Price extraction - supports formats like "500K-2M", "3-5 juta", "1M-2M"
+    // Format: number + optional unit - number + optional unit
+    const pricePattern = /(\d+)\s*(K|k|rb|ribu|jt|juta|M|million|mio)?\s*[-–]\s*(\d+)\s*(K|k|rb|ribu|jt|juta|M|million|mio)?/i;
+    const priceMatch = query.match(pricePattern);
     if (priceMatch) {
-        updatedQuery.minPrice = parseInt(priceMatch[1]) * 1000000;
-        updatedQuery.maxPrice = parseInt(priceMatch[2]) * 1000000;
+        const parsePrice = (value: string, unit: string | undefined): number => {
+            const num = parseInt(value);
+            const u = (unit || "").toLowerCase();
+            if (u === "k" || u === "rb" || u === "ribu") return num * 1000;
+            if (u === "m" || u === "jt" || u === "juta" || u === "million" || u === "mio") return num * 1000000;
+            // If no unit but number is small (like 2), assume millions
+            if (!u && num <= 100) return num * 1000000;
+            return num;
+        };
+        updatedQuery.minPrice = parsePrice(priceMatch[1], priceMatch[2]);
+        updatedQuery.maxPrice = parsePrice(priceMatch[3], priceMatch[4]);
+    }
+
+    // Also handle "around X" budget pattern
+    if (!updatedQuery.minPrice && !updatedQuery.maxPrice) {
+        const aroundPattern = /(?:around|sekitar|about|approximately|kira-kira|budget)\s*(\d+)\s*(K|k|ribu|rb|jt|juta|million|M)?/i;
+        const aroundMatch = query.match(aroundPattern);
+        if (aroundMatch) {
+            let baseValue = parseInt(aroundMatch[1]);
+            const unit = aroundMatch[2]?.toLowerCase() || "";
+
+            if (unit === "k" || unit === "ribu" || unit === "rb") {
+                baseValue *= 1000;
+            } else if (unit === "jt" || unit === "juta" || unit === "million" || unit === "m") {
+                baseValue *= 1000000;
+            }
+
+            // Apply ±100K or ±20% range
+            const variation = Math.max(100000, baseValue * 0.2);
+            updatedQuery.minPrice = Math.max(0, baseValue - variation);
+            updatedQuery.maxPrice = baseValue + variation;
+        }
+    }
+
+    // Extract colors and specs from the message
+    const colors = ["white", "black", "red", "blue", "green", "yellow", "pink", "purple", "orange", "brown", "grey", "gray", "gold", "silver"];
+    const features = [
+        // Connectivity
+        "wireless", "wired", "bluetooth", "wifi", "usb",
+        // Gaming/Performance
+        "gaming", "rgb", "mechanical", "ergonomic", "portable", "rechargeable",
+        // For laptops/computers
+        "amd", "ryzen", "nvidia", "rtx", "gtx", "ssd", "hdd",
+        // For clothing/fashion
+        "leather", "cotton", "waterproof", "windproof", "casual", "formal",
+        // Mouse specific
+        "gripclaw", "claw", "palm", "fingertip",
+        // Size
+        "small", "medium", "large", "mini", "compact", "lightweight"
+    ];
+    const extractedSpecs: string[] = [];
+
+    // Pattern-based extraction for multi-word specs
+    const specPatterns = [
+        // RAM patterns: "RAM 16 GB", "16GB RAM", "ram 8gb"
+        /ram\s*(\d+)\s*(gb|g)/i,
+        /(\d+)\s*(gb|g)\s*ram/i,
+        // Intel patterns: "intel gen 13", "intel core i7", "i7 gen 13"
+        /intel\s*(gen\s*\d+|core\s*i\d+|i\d+)/i,
+        /i[357]\s*(gen\s*\d+)?/i,
+        // Storage patterns: "512 GB SSD", "1TB HDD"
+        /(\d+)\s*(gb|tb)\s*(ssd|hdd|storage)/i,
+        /ssd\s*(\d+)\s*(gb|tb)/i,
+        // Screen size: "15 inch", "14\""
+        /(\d+\.?\d*)\s*(inch|")/i,
+        // AMD patterns
+        /amd\s*(ryzen\s*\d+)?/i,
+        /ryzen\s*\d+/i,
+    ];
+
+    for (const pattern of specPatterns) {
+        const match = query.match(pattern);
+        if (match) {
+            extractedSpecs.push(match[0].trim());
+        }
+    }
+
+    // Single-word color extraction
+    for (const color of colors) {
+        if (queryLower.includes(color)) {
+            extractedSpecs.push(color + " color");
+        }
+    }
+    // Single-word feature extraction (skip "intel" if already captured as phrase)
+    for (const feature of features) {
+        if (queryLower.includes(feature) && !extractedSpecs.some(s => s.toLowerCase().includes(feature))) {
+            extractedSpecs.push(feature);
+        }
+    }
+
+    if (extractedSpecs.length > 0) {
+        updatedQuery.specConstraints = extractedSpecs;
     }
 
     // Brand extraction
-    const brands = ["asus", "lenovo", "hp", "acer", "dell", "msi", "samsung", "apple", "xiaomi", "oppo", "vivo", "sony"];
+    const brands = ["asus", "lenovo", "hp", "acer", "dell", "msi", "samsung", "apple", "xiaomi", "oppo", "vivo", "sony", "logitech", "razer", "steelseries"];
     for (const brand of brands) {
         if (queryLower.includes(brand)) {
             updatedQuery.preferredBrand = brand;
